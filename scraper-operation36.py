@@ -3,7 +3,7 @@ Operation 36 enrollments scraper.
 Logs into Operation 36, iterates through all family cards,
 clicks View Details for each, clicks Enrollments tab, and extracts enrollment data.
 
-Output: output/operation36_enrollments.csv
+Output: output/operation36_families.csv, output/operation36_enrollments.csv
 
 Usage:  python scraper-operation36.py
 """
@@ -11,6 +11,7 @@ Usage:  python scraper-operation36.py
 import os
 import re
 import csv
+from collections import Counter
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 import config
@@ -36,13 +37,12 @@ def scroll_to_load_all_families(page):
     prev_count = 0
     stable_rounds = 0
     while True:
-        # Scroll down incrementally to trigger infinite scroll loading
-        container.evaluate("el => el.scrollBy(0, 1000)")
-        page.wait_for_timeout(1000)
-        # Also jump to bottom to ensure we trigger the load threshold
-        container.evaluate("el => el.scrollTop = el.scrollHeight")
+        rows = page.locator(".FamiliesTable_row__AQCjl")
+        count = rows.count()
+        if count > 0:
+            rows.nth(count - 1).scroll_into_view_if_needed()
         page.wait_for_timeout(3000)
-        current_count = page.locator(".FamiliesTable_row__AQCjl").count()
+        current_count = rows.count()
         print(f"  Scrolling... {current_count} families loaded")
         if current_count == prev_count:
             stable_rounds += 1
@@ -52,13 +52,22 @@ def scroll_to_load_all_families(page):
             stable_rounds = 0
         prev_count = current_count
     print(f"  Done scrolling. Total families: {current_count}")
-    # Scroll back to top
     container.evaluate("el => el.scrollTop = 0")
     page.wait_for_timeout(1000)
 
 
-def get_family_info(page):
-    """Get all family names from the table rows."""
+def navigate_to_families(page):
+    """Navigate to families page and load all families."""
+    page.goto(config.OPERATION36_FAMILIES_URL, wait_until="networkidle")
+    page.wait_for_timeout(3000)
+    page.locator("#tableContent").wait_for(timeout=15000)
+    page.wait_for_timeout(2000)
+    scroll_to_load_all_families(page)
+
+
+def collect_families(page):
+    """First pass: scroll to load all families, extract name and email."""
+    navigate_to_families(page)
     rows = page.locator(".FamiliesTable_row__AQCjl")
     count = rows.count()
     families = []
@@ -66,36 +75,87 @@ def get_family_info(page):
         row = rows.nth(i)
         name_el = row.locator("h5")
         name = name_el.text_content().strip() if name_el.count() > 0 else f"Family_{i}"
-        families.append(name)
+
+        # Email is inside FamiliesTable_familyAdmin__o03AK span
+        email = ""
+        admin_div = row.locator(".FamiliesTable_familyAdmin__o03AK")
+        if admin_div.count() > 0:
+            spans = admin_div.locator("span")
+            for j in range(spans.count()):
+                text = spans.nth(j).text_content().strip()
+                if "@" in text:
+                    email = text
+                    break
+
+        families.append({"family_name": name, "email": email, "family_url": ""})
+
+    # Sort alphabetically by family_name
+    families.sort(key=lambda f: f["family_name"].lower())
+    print(f"Collected {len(families)} families")
     return families
 
 
-def navigate_to_families(page):
-    """Navigate to families page and load all families."""
-    page.goto(config.OPERATION36_FAMILIES_URL, wait_until="networkidle")
-    page.wait_for_timeout(3000)
+def search_and_capture_urls(page, families):
+    """Second pass: search each family by name, click View Details, capture URL."""
+    # Count duplicates so we know how many results to expect
+    name_counts = Counter(f["family_name"] for f in families)
 
-    # Wait for table content
-    page.locator("#tableContent").wait_for(timeout=15000)
-    page.wait_for_timeout(2000)
+    # Group families by name for processing duplicates together
+    processed_names = set()
 
-    # Scroll to load all
-    scroll_to_load_all_families(page)
+    for i, fam in enumerate(families):
+        name = fam["family_name"]
+        if name in processed_names:
+            continue  # Already handled as part of a duplicate group
+
+        expected_count = name_counts[name]
+        print(f"\n  [{i+1}/{len(families)}] Searching: {name} (expect {expected_count} result(s))")
+
+        # Clear search bar and type family name
+        search_box = page.get_by_role("textbox", name="Search for Families")
+        search_box.fill("")
+        page.wait_for_timeout(500)
+        search_box.fill(name)
+        page.wait_for_timeout(3000)
+
+        # Wait for results to load
+        rows = page.locator(".FamiliesTable_row__AQCjl")
+        result_count = rows.count()
+        print(f"    Found {result_count} search result(s)")
+
+        # Get all families with this name (in sorted order)
+        matching_indices = [j for j, f in enumerate(families) if f["family_name"] == name]
+
+        for k in range(min(result_count, expected_count)):
+            row = rows.nth(k)
+            view_btn = row.locator("button.btn-primary")
+            view_btn.click()
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_timeout(1500)
+
+            family_url = page.url
+            idx = matching_indices[k] if k < len(matching_indices) else matching_indices[0]
+            families[idx]["family_url"] = family_url
+            print(f"    [{k+1}/{expected_count}] {name} -> {family_url}")
+
+            # Go back to search results
+            page.go_back(timeout=60000)
+            page.wait_for_timeout(2000)
+
+        processed_names.add(name)
+
+    return families
 
 
-def click_view_details(page, family_index):
-    """Click View Details for a specific family row and return the URL."""
-    rows = page.locator(".FamiliesTable_row__AQCjl")
-    row = rows.nth(family_index)
-    row.scroll_into_view_if_needed()
-    page.wait_for_timeout(500)
-
-    # Click the "View Details" button inside this row
-    view_btn = row.locator("button.btn-primary")
-    view_btn.click()
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(2000)
-    return page.url
+def export_families_csv(families):
+    """Write families to CSV."""
+    os.makedirs("output", exist_ok=True)
+    family_csv = "output/operation36_families.csv"
+    with open(family_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["family_name", "email", "family_url"])
+        writer.writeheader()
+        writer.writerows(families)
+    print(f"\nExported {len(families)} families to {family_csv}")
 
 
 def get_enrollments(page, family_name):
@@ -110,10 +170,8 @@ def get_enrollments(page, family_name):
         print(f"    No Enrollments button: {e}")
         return enrollments
 
-    # Dump visible text to parse enrollments
     body_text = page.inner_text("body")
 
-    # Find the enrollments section after the header row
     if "Payment Status\nStatus" in body_text:
         enroll_section = body_text.split("Payment Status\nStatus")[-1]
     elif "Enrollments" in body_text:
@@ -122,24 +180,18 @@ def get_enrollments(page, family_name):
     else:
         enroll_section = body_text
 
-    # Parse enrollment entries
-    # Format: number\n\nstudent_name\nprogram_name\npackage_and_amount\npayment_status\nstatus
     lines = [l.strip() for l in enroll_section.strip().split("\n")]
 
     i = 0
     while i < len(lines):
-        # Skip empty lines and look for a standalone number (the row index)
         if not lines[i] or not re.match(r"^\d+$", lines[i]):
             i += 1
             continue
 
-        # Found a number — next non-empty lines are the enrollment fields
         i += 1
-        # Skip any empty lines after the number
         while i < len(lines) and not lines[i]:
             i += 1
 
-        # Need at least 5 lines: student, program, package, payment, status
         remaining = []
         while i < len(lines) and len(remaining) < 5:
             if lines[i]:
@@ -147,18 +199,12 @@ def get_enrollments(page, family_name):
             i += 1
 
         if len(remaining) >= 5:
-            student_name = remaining[0]
-            program_name = remaining[1]
-            package_and_amount = remaining[2]
-            payment_status = remaining[3]
-            status = remaining[4]
-
             enrollments.append({
-                "student_name": student_name,
-                "program_name": program_name,
-                "package_and_amount": package_and_amount,
-                "payment_status": payment_status,
-                "status": status,
+                "student_name": remaining[0],
+                "program_name": remaining[1],
+                "package_and_amount": remaining[2],
+                "payment_status": remaining[3],
+                "status": remaining[4],
             })
 
     print(f"    Parsed {len(enrollments)} enrollments")
@@ -166,31 +212,41 @@ def get_enrollments(page, family_name):
 
 
 def scrape_all_enrollments(page):
-    """Iterate over all families and collect their enrollments."""
-    navigate_to_families(page)
-    families = get_family_info(page)
-    print(f"Found {len(families)} families:")
+    """Collect families, get URLs via search, then scrape enrollments."""
+    # Phase 1: collect all family names and emails
+    print("Phase 1: Collecting family names and emails...")
+    families = collect_families(page)
     for f in families:
-        print(f"  - {f}")
+        print(f"  {f['family_name']} | {f['email']}")
 
+    # Phase 2: search each family to get URLs
+    print(f"\nPhase 2: Searching families to capture URLs...")
+    families = search_and_capture_urls(page, families)
+
+    # Save families CSV
+    export_families_csv(families)
+
+    # Phase 3: visit each family's enrollment page
+    print(f"\nPhase 3: Scraping enrollments for {len(families)} families...")
     all_enrollments = []
-    for i, family_name in enumerate(families):
+    for i, fam in enumerate(families):
+        family_name = fam["family_name"]
         family_id = family_name.lower().replace(" ", "")
         print(f"\n  [{i+1}/{len(families)}] {family_name}")
 
-        # Go back to families page if not the first
-        if i > 0:
-            navigate_to_families(page)
+        if not fam["family_url"]:
+            print(f"    No URL found, skipping")
+            continue
 
-        # Click View Details
-        family_url = click_view_details(page, i)
-        print(f"    URL: {family_url}")
+        enroll_url = fam["family_url"].rstrip("/") + "/enrollments"
+        page.goto(enroll_url, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(2000)
+        print(f"    URL: {enroll_url}")
 
-        # Get enrollments
         enrollments = get_enrollments(page, family_name)
         for enr in enrollments:
             enr["family_identifier"] = family_id
-            enr["family_url"] = family_url
+            enr["family_url"] = enroll_url
             all_enrollments.append(enr)
         print(f"    Found {len(enrollments)} enrollments")
 

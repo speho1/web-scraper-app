@@ -1,0 +1,13 @@
+email: locator("input[name=\"email\"]")
+password: locator("input[name=\"password\"]")
+login button: get_by_role("button",name="Log In")
+families page: https://operation36golf.com/members/families
+Get all family members: locator("#tableContent")
+Filter underneath tableContent: locator("#tableContent div").filter(has_text="Coach Angella Then").nth(1)locator("#tableContent div").filter(has_text="Coach Angella Then").nth(1)
+family card example: get_by_role("button", name="Palacios Family Andrew")
+family card view details button: get_by_role("button", name="Palacios Family Andrew").locator("button")
+Once family card view details button is clicked, also track the family url
+enrollments button: get_by_role("button", name="Enrollments")
+enrollments card example: get_by_text("5Andrew PalaciosPrivate 9")
+search bar: get_by_role("textbox", name="Search for Families")
+
