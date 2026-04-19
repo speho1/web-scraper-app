@@ -3,7 +3,7 @@ Operation 36 families scraper.
 Logs into Operation 36, scrolls to load all families, extracts names and emails,
 then searches each family to capture their URL.
 
-Output: output/operation36_families.csv (family_name, email, family_url)
+Output: output/operation36_families.csv (family_name, email, phone, family_url)
 
 Usage:  python scraper-operation36-families.py
 """
@@ -79,6 +79,7 @@ def collect_families(page):
         name = re.sub(r"\s*Family$", "", name).strip()
 
         email = ""
+        phone = ""
         admin_div = row.locator(".FamiliesTable_familyAdmin__o03AK")
         if admin_div.count() > 0:
             spans = admin_div.locator("span")
@@ -86,9 +87,10 @@ def collect_families(page):
                 text = spans.nth(j).text_content().strip()
                 if "@" in text:
                     email = text
-                    break
+                elif not phone and re.search(r"\d", text) and len(re.findall(r"\d", text)) >= 7:
+                    phone = text
 
-        families.append({"family_name": name, "email": email, "family_id": ""})
+        families.append({"family_name": name, "email": email, "phone": phone, "family_id": ""})
 
     families.sort(key=lambda f: f["family_name"].lower())
     print(f"Collected {len(families)} families")
@@ -148,7 +150,7 @@ def export_families_csv(families):
     os.makedirs("output", exist_ok=True)
     family_csv = "output/operation36_families.csv"
     with open(family_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["family_name", "email", "family_id"])
+        writer = csv.DictWriter(f, fieldnames=["family_name", "email", "phone", "family_id"])
         writer.writeheader()
         writer.writerows(families)
     print(f"\nExported {len(families)} families to {family_csv}")
@@ -172,7 +174,7 @@ def main():
         print("Collecting families...")
         families = collect_families(page)
         for f in families:
-            print(f"  {f['family_name']} | {f['email']}")
+            print(f"  {f['family_name']} | {f['email']} | {f['phone']}")
 
         print(f"\nSearching families to capture URLs...")
         families = search_and_capture_urls(page, families)
