@@ -1,9 +1,12 @@
 """
-CoachNow contact scraper.
+CoachNow contacts scraper.
 Logs in, navigates to /contacts, scrolls to load all contacts,
-extracts contact info and lesson history, and exports to two CSVs:
-  - output/contacts.csv: firstnamelastname, email, first_name, last_name, phone
-  - output/lesson_history.csv: firstnamelastname, lesson_name, date
+extracts contact info, writes coachnow_players.csv, then iterates
+each contact to capture lesson history.
+
+Output:
+  - output/coachnow_players.csv (first_name, last_name, email, phone)
+  - output/lesson_history.csv (first_name, last_name, lesson_name, date)
 
 Usage:  python scraper.py
 """
@@ -16,6 +19,9 @@ from playwright.sync_api import sync_playwright
 import config
 
 load_dotenv()
+
+PLAYERS_OUTPUT = "output/coachnow_players.csv"
+LESSONS_OUTPUT = "output/lesson_history.csv"
 
 
 def login(page):
@@ -35,76 +41,88 @@ def login(page):
     page.wait_for_load_state("networkidle")
 
 
-def scroll_to_load_all(page):
-    """Scroll down repeatedly until all contacts are loaded."""
+def scroll_to_load_all_contacts(page):
+    """Scroll the page to load all contact cards.
+    Scrolls the last View button into view — works whether the list lives
+    on the window or inside an inner scroll container."""
+    buttons = page.get_by_role("button", name="View")
     prev_count = 0
     stable_rounds = 0
     while True:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        count = buttons.count()
+        if count > 0:
+            try:
+                buttons.nth(count - 1).scroll_into_view_if_needed()
+            except Exception:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(3000)
-        current_count = page.get_by_role("button", name="View").count()
+        current_count = buttons.count()
         print(f"  Scrolling... {current_count} contacts loaded")
         if current_count == prev_count:
             stable_rounds += 1
-            # Wait for 3 stable rounds to be sure everything is loaded
-            if stable_rounds >= 3:
+            if stable_rounds >= 5:
                 break
         else:
             stable_rounds = 0
         prev_count = current_count
-    # Scroll back to top
+    print(f"  Done scrolling. Total contacts: {current_count}")
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(1000)
 
 
-def scrape_contacts(page):
-    """Scrape all contacts from the contacts page."""
+def navigate_to_contacts(page):
+    """Navigate to contacts page and load all contacts."""
+    page.goto(config.CONTACTS_URL, wait_until="networkidle")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(5000)
-
-    all_contacts = []
-
-    # Wait for View buttons to appear (one per contact)
     try:
         page.get_by_role("button", name="View").first.wait_for(timeout=15000)
     except Exception:
         print("No contacts found on page.")
-        return all_contacts
-
-    # Scroll to load all contacts
+        return False
     print("Loading all contacts...")
-    scroll_to_load_all(page)
+    scroll_to_load_all_contacts(page)
+    return True
+
+
+def collect_contacts(page):
+    """Scroll to load all contacts, extract first_name, last_name, email, phone."""
+    if not navigate_to_contacts(page):
+        return []
 
     num_contacts = page.get_by_role("button", name="View").count()
     print(f"Total contacts found: {num_contacts}")
 
-    # Get all email links and phone links
     email_links = page.get_by_role("link").filter(has_text=re.compile(r"@"))
     phone_links = page.get_by_role("link").filter(has_text=re.compile(r"^\+"))
 
-    emails = []
-    for i in range(email_links.count()):
-        emails.append(email_links.nth(i).text_content().strip())
+    emails = [
+        email_links.nth(i).text_content().strip()
+        for i in range(email_links.count())
+    ]
+    phones = [
+        phone_links.nth(i).text_content().strip()
+        for i in range(phone_links.count())
+    ]
 
-    phones = []
-    for i in range(phone_links.count()):
-        phones.append(phone_links.nth(i).text_content().strip())
-
-    # Parse contact names from visible text
     body_text = page.inner_text("body")
-    contacts_section = body_text.split("Add Contacts")[-1] if "Add Contacts" in body_text else body_text
+    contacts_section = (
+        body_text.split("Add Contacts")[-1]
+        if "Add Contacts" in body_text
+        else body_text
+    )
 
-    # Split by "View" to get each contact's text block
-    # Use regex to split on standalone "View" lines
     contact_blocks = re.split(r"\nView\n", contacts_section)
     contact_blocks = [b.strip() for b in contact_blocks if b.strip()]
-
-    # The last block may contain non-contact footer text — only keep blocks
-    # that contain email-like text or "No Email"
-    contact_blocks = [b for b in contact_blocks if "No Email" in b or "@" in b or "No Phone" in b]
+    contact_blocks = [
+        b for b in contact_blocks
+        if "No Email" in b or "@" in b or "No Phone" in b
+    ]
 
     print(f"Parsed {len(contact_blocks)} contact blocks")
 
+    contacts = []
+    seen = set()
     email_idx = 0
     phone_idx = 0
 
@@ -113,14 +131,10 @@ def scrape_contacts(page):
         if not lines:
             continue
 
-        # First meaningful line is the name (skip initials like "AS", "AF")
-        # Initials are 1-3 uppercase-only chars with no spaces
         name = ""
         for line in lines:
-            # Skip lines that are just uppercase initials (1-3 chars, all caps)
             if re.match(r"^[A-Z]{1,3}$", line):
                 continue
-            # Skip known non-name lines
             if line in ("No Email", "No Phone") or "@" in line or line.startswith("+"):
                 continue
             name = line
@@ -129,35 +143,34 @@ def scrape_contacts(page):
         parts = name.split(" ", 1)
         first_name = parts[0] if parts else ""
         last_name = parts[1] if len(parts) > 1 else ""
+        if not first_name:
+            continue
 
-        # Build unique identifier
-        firstnamelastname = f"{first_name}{last_name}".lower().replace(" ", "")
+        key = (first_name.lower(), last_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
 
-        # Check for email
-        has_email = "No Email" not in block
         email = ""
-        if has_email and email_idx < len(emails):
+        if "No Email" not in block and email_idx < len(emails):
             email = emails[email_idx]
             email_idx += 1
 
-        # Check for phone
-        has_phone = "No Phone" not in block
         phone = ""
-        if has_phone and phone_idx < len(phones):
+        if "No Phone" not in block and phone_idx < len(phones):
             phone = phones[phone_idx]
             phone_idx += 1
 
-        all_contacts.append({
-            "firstnamelastname": firstnamelastname,
+        contacts.append({
             "first_name": first_name,
             "last_name": last_name,
             "email": email,
             "phone": phone,
         })
-
         print(f"  Found: {first_name} {last_name} | {email} | {phone}")
 
-    return all_contacts
+    print(f"Collected {len(contacts)} contacts")
+    return contacts
 
 
 def get_lesson_histories(page, contacts):
@@ -166,21 +179,17 @@ def get_lesson_histories(page, contacts):
 
     for i, contact in enumerate(contacts):
         name = f"{contact['first_name']} {contact['last_name']}".strip()
-        firstnamelastname = contact["firstnamelastname"]
         print(f"  [{i+1}/{len(contacts)}] Getting lessons for: {name}...")
 
-        # Scroll the View button into view and click it
         view_button = page.get_by_role("button", name="View").nth(i)
         view_button.scroll_into_view_if_needed()
         view_button.click()
         page.wait_for_timeout(1500)
 
-        # Check if History button exists
         try:
             page.get_by_role("button", name="History").wait_for(timeout=5000)
         except Exception:
             print(f"    No lesson panel for {name}")
-            # Close whatever opened
             try:
                 page.get_by_role("img", name="close").click()
                 page.wait_for_timeout(500)
@@ -192,19 +201,14 @@ def get_lesson_histories(page, contacts):
         page.get_by_role("button", name="History").click()
         page.wait_for_timeout(1500)
 
-        # Capture the text content of the history panel BEFORE looking for lessons
-        # Take a snapshot of what's visible in the popover/modal
-        # Only look at text that appeared AFTER clicking History
         lesson_count_before = len(all_lessons)
 
         try:
-            # Get the close button's parent container — that's the modal/popover
             close_btn = page.get_by_role("img", name="close")
-            # Navigate up to find the modal container
-            modal = close_btn.locator("xpath=ancestor::div[contains(@class, 'modal') or contains(@class, 'popup') or contains(@class, 'dialog') or position()=1]").first
+            modal = close_btn.locator(
+                "xpath=ancestor::div[contains(@class, 'modal') or contains(@class, 'popup') or contains(@class, 'dialog') or position()=1]"
+            ).first
 
-            # Try to get text from the modal area
-            # If we can't find a specific modal, get all visible text near the History button
             modal_text = ""
             try:
                 modal_text = modal.text_content()
@@ -212,21 +216,22 @@ def get_lesson_histories(page, contacts):
                 pass
 
             if not modal_text:
-                # Fallback: get text from the area around the History button
                 modal_text = close_btn.locator("xpath=../..").text_content()
 
-            # Parse lesson entries from modal text
-            # Look for patterns like "MAR19Adult Member Private" or "MAR 19 Adult Member Private"
-            # Only match valid month abbreviations to avoid false positives
             valid_months = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
-            matches = re.findall(rf"({valid_months})(\d{{1,2}})((?:(?!(?:{valid_months})\d).)+)", modal_text)
+            matches = re.findall(
+                rf"({valid_months})(\d{{1,2}})((?:(?!(?:{valid_months})\d).)+)",
+                modal_text,
+            )
 
             for month, day, lesson_name in matches:
                 lesson_name = lesson_name.strip()
-                # Filter out non-lesson text (like "Upcoming", "History", button labels)
-                if lesson_name and lesson_name not in ("Upcoming", "History", "View", "Edit", "Delete", ""):
+                if lesson_name and lesson_name not in (
+                    "Upcoming", "History", "View", "Edit", "Delete", "",
+                ):
                     all_lessons.append({
-                        "firstnamelastname": firstnamelastname,
+                        "first_name": contact["first_name"],
+                        "last_name": contact["last_name"],
                         "lesson_name": lesson_name,
                         "date": f"{month} {day}",
                     })
@@ -237,7 +242,6 @@ def get_lesson_histories(page, contacts):
         lessons_found = len(all_lessons) - lesson_count_before
         print(f"    Found {lessons_found} lessons")
 
-        # Close the popover/modal
         try:
             page.get_by_role("img", name="close").click()
             page.wait_for_timeout(500)
@@ -248,25 +252,28 @@ def get_lesson_histories(page, contacts):
     return all_lessons
 
 
-def export_csvs(contacts, lessons):
-    """Write contacts and lesson history to separate CSVs."""
+def export_players_csv(contacts):
+    """Write contacts to coachnow_players.csv."""
     os.makedirs("output", exist_ok=True)
-
-    with open("output/contacts.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "firstnamelastname", "email", "first_name", "last_name", "phone"
-        ])
+    with open(PLAYERS_OUTPUT, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["first_name", "last_name", "email", "phone"]
+        )
         writer.writeheader()
         writer.writerows(contacts)
-    print(f"Exported {len(contacts)} contacts to output/contacts.csv")
+    print(f"Exported {len(contacts)} contacts to {PLAYERS_OUTPUT}")
 
-    with open("output/lesson_history.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "firstnamelastname", "lesson_name", "date"
-        ])
+
+def export_lessons_csv(lessons):
+    """Write lesson history to lesson_history.csv."""
+    os.makedirs("output", exist_ok=True)
+    with open(LESSONS_OUTPUT, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["first_name", "last_name", "lesson_name", "date"]
+        )
         writer.writeheader()
         writer.writerows(lessons)
-    print(f"Exported {len(lessons)} lessons to output/lesson_history.csv")
+    print(f"Exported {len(lessons)} lessons to {LESSONS_OUTPUT}")
 
 
 def main():
@@ -283,17 +290,17 @@ def main():
 
         login(page)
         page.wait_for_timeout(3000)
-        page.goto(config.CONTACTS_URL, wait_until="networkidle")
 
-        print("Scraping contacts...")
-        contacts = scrape_contacts(page)
+        print("Collecting contacts...")
+        contacts = collect_contacts(page)
+        export_players_csv(contacts)
 
         lessons = []
         if contacts:
-            print(f"\nGetting lesson histories...")
+            print("\nGetting lesson histories...")
             lessons = get_lesson_histories(page, contacts)
 
-        export_csvs(contacts, lessons)
+        export_lessons_csv(lessons)
         browser.close()
 
 
