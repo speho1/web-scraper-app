@@ -54,23 +54,25 @@ async def get_button_name(btn):
 
 
 def parse_student_name(button_name):
-    """Parse student button label to extract (first, last) name.
+    """Parse student button label to extract (first, last, age).
     Handles accessible-name form 'student 1 Mala Raman 55yrs /' and the
     text-content form '1Mala Raman55yrs / Female...' where the leading card
     index is concatenated and '55yrs' touches the last name with no space."""
     if not button_name:
-        return ("", "")
+        return ("", "", "")
     s = button_name.strip()
     s = re.sub(r"^student\s+\d+\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"^\d+\s*", "", s)
+    age_match = re.search(r"(\d+)\s*y(?:r|ear)s?\b", s, flags=re.IGNORECASE)
+    age = age_match.group(1) if age_match else ""
     s = re.split(r"\d+\s*y(?:r|ear)s?\b", s, maxsplit=1, flags=re.IGNORECASE)[0]
     s = s.strip().rstrip("/").strip()
     parts = s.split()
     if not parts:
-        return ("", "")
+        return ("", "", age)
     if len(parts) == 1:
-        return (parts[0], "")
-    return (parts[0], " ".join(parts[1:]))
+        return (parts[0], "", age)
+    return (parts[0], " ".join(parts[1:]), age)
 
 
 async def scroll_to_load_all_students(page):
@@ -113,7 +115,7 @@ async def collect_students(page):
     seen = set()
     for i in range(count):
         btn_name = await get_button_name(buttons.nth(i))
-        first, last = parse_student_name(btn_name)
+        first, last, age = parse_student_name(btn_name)
         if not first:
             continue
         key = (first.lower(), last.lower())
@@ -123,6 +125,7 @@ async def collect_students(page):
         students.append({
             "first_name": first,
             "last_name": last,
+            "age": age,
             "member_url": "",
             "family_url": "",
         })
@@ -238,7 +241,7 @@ async def find_button_for(page, first_name, last_name, fallback_index):
     count = await buttons.count()
     for bi in range(count):
         bname = await get_button_name(buttons.nth(bi))
-        bfn, bln = parse_student_name(bname)
+        bfn, bln, _ = parse_student_name(bname)
         if bfn.lower() == first_name.lower() and bln.lower() == last_name.lower():
             return buttons.nth(bi)
     if count > fallback_index:
@@ -266,7 +269,7 @@ async def process_group(page, first_name, student_group, worker_id):
 
     for k in range(min(result_count, expected_count)):
         btn_name = await get_button_name(buttons.nth(k))
-        fn, ln = parse_student_name(btn_name)
+        fn, ln, _ = parse_student_name(btn_name)
 
         target_student = None
         for s in student_group:
@@ -323,7 +326,7 @@ def export_players_csv(students):
     os.makedirs("output", exist_ok=True)
     with open(PLAYERS_OUTPUT, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["first_name", "last_name", "member_url", "family_url"]
+            f, fieldnames=["first_name", "last_name", "age", "member_url", "family_url"]
         )
         writer.writeheader()
         writer.writerows(students)
