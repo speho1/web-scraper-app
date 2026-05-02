@@ -39,6 +39,8 @@ ADMIN_ENTRY_PATTERN = re.compile(
 PHONE_PATTERN = re.compile(r"\+?\d?\s*\(?\d{3}\)?[\s\-\.]\s*\d{3}[\s\-\.]\s*\d{4}")
 EMAIL_PATTERN = re.compile(r"[\w\.\-+]+@[\w\.\-]+\.\w+")
 PROFILE_HREF_PATTERN = re.compile(r"/profile/(\d+)")
+EMAIL_LEADING_PHONE_FRAGMENT = re.compile(r"^[\d\-\.\+\s]+")
+EMAIL_LEADING_GENDER_MARKER = re.compile(r"^[MF](?=[a-z])")
 
 
 async def login(page):
@@ -121,9 +123,19 @@ async def extract_contact_for_admin(admin_loc):
             if pm:
                 phone = re.sub(r"\s+", " ", pm.group(0)).strip()
         if not email:
-            em = EMAIL_PATTERN.search(text)
+            # Strip phone matches first so the trailing digits of a phone
+            # don't get pulled into the email's local part.
+            text_for_email = PHONE_PATTERN.sub(" ", text)
+            em = EMAIL_PATTERN.search(text_for_email)
             if em:
-                email = em.group(0).strip()
+                local, _, domain = em.group(0).strip().partition("@")
+                # Drop any phone-fragment leftovers (the strict phone regex
+                # may have missed a malformed phone) and a leading gender
+                # marker rendered directly before the email.
+                local = EMAIL_LEADING_PHONE_FRAGMENT.sub("", local)
+                local = EMAIL_LEADING_GENDER_MARKER.sub("", local)
+                if local and domain:
+                    email = f"{local}@{domain}"
         if phone and email:
             break
     return phone, email
