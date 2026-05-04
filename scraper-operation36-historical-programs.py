@@ -1,20 +1,22 @@
 """
-Operation 36 programs scraper.
-Logs into Operation 36, navigates to the programs page, scrolls to load all
-program cards, and extracts each program's ID. For each program, visits
-/programs/{id}/overview to capture program name, start date, end date, and
-weekday, then visits /programs/{id} to capture enrolled students.
+Operation 36 historical programs scraper.
+Logs into Operation 36, navigates to the programs page, switches to the
+"Completed" tab, scrolls to load all completed program cards, and extracts
+each program's ID. For each program, visits /programs/{id}/overview to
+capture program name, start date, end date, and weekday, then visits
+/programs/{id}/roster to capture enrolled students.
 
 Collection of program IDs is sequential; per-program metadata + student
 capture is parallelized across NUM_WORKERS workers pulling from a shared
 queue.
 
 Outputs:
-  output/operation36_programs.csv          (programId, programName, startDate,
-                                            endDate, weekday)
-  output/operation36_enrolled_students.csv (studentId, studentName, programId)
+  output/operation36_historical_programs.csv          (programId, programName,
+                                                       startDate, endDate, weekday)
+  output/operation36_historical_enrolled_students.csv (studentId, studentName,
+                                                       programId)
 
-Usage:  python scraper-operation-36-programs.py
+Usage:  python scraper-operation36-historical-programs.py
 """
 
 import os
@@ -28,11 +30,12 @@ import config
 load_dotenv()
 
 OPERATION36_PROGRAMS_URL = "https://operation36golf.com/programs"
-PROGRAMS_OUTPUT = "output/operation36_programs.csv"
-ENROLLED_STUDENTS_OUTPUT = "output/operation36_enrolled_students.csv"
+PROGRAMS_OUTPUT = "output/operation36_historical_programs.csv"
+ENROLLED_STUDENTS_OUTPUT = "output/operation36_historical_enrolled_students.csv"
 
 PROGRAM_HREF_PATTERN = re.compile(r"/programs/(\d+)")
 STUDENT_ROW_PATTERN = re.compile(r"^student \d+ ", re.IGNORECASE)
+COMPLETED_TAB_PATTERN = re.compile(r"^Completed\b", re.IGNORECASE)
 
 # "Mar 14, 2026 - Jun 6, 2026" or "Mar 14, 2026 - Jun 6" (no trailing year)
 DATE_RANGE_PATTERN = re.compile(
@@ -60,6 +63,17 @@ async def login(page):
     await page.wait_for_load_state("networkidle")
 
 
+async def click_completed_tab(page):
+    """Switch the programs page to the Completed tab. The tab label includes a
+    count (e.g. 'Completed (26)') that changes over time, so match by prefix."""
+    tab = page.get_by_role("tab", name=COMPLETED_TAB_PATTERN).first
+    await tab.wait_for(state="visible", timeout=30000)
+    label = (await tab.text_content() or "").strip()
+    print(f"  Clicking tab: {label}")
+    await tab.click()
+    await page.wait_for_timeout(3000)
+
+
 async def scroll_to_load_all_programs(page):
     """Scroll the page to load all program cards."""
     links = page.locator("a[href*='/programs/']")
@@ -85,9 +99,11 @@ async def scroll_to_load_all_programs(page):
 
 
 async def navigate_to_programs(page):
-    """Navigate to the programs page and load all program cards."""
+    """Navigate to the programs page, switch to the Completed tab, and load
+    all program cards."""
     await page.goto(OPERATION36_PROGRAMS_URL, wait_until="networkidle")
     await page.wait_for_timeout(3000)
+    await click_completed_tab(page)
     await scroll_to_load_all_programs(page)
 
 
@@ -405,7 +421,7 @@ async def main():
         await login(login_page)
         await login_page.wait_for_timeout(2000)
 
-        print("Collecting program IDs...")
+        print("Collecting completed program IDs...")
         program_ids = await collect_program_ids(login_page)
         for pid in program_ids:
             print(f"  {pid}")
